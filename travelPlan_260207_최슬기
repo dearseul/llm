@@ -1,0 +1,101 @@
+from pydantic import BaseModel, Field
+from typing import List
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_openai import ChatOpenAI
+from langchain_core.output_parsers import StrOutputParser, PydanticOutputParser # parser 추가
+import gradio as gr
+
+# 1. Pydantic 모델 정의
+class DailyActivity(BaseModel):
+    time_slot: str = Field(description="시간대 (예: 오전, 점심, 오후, 저녁)")
+    activity: str = Field(description="활동 내용")
+    location: str = Field(description="장소 또는 맛집 이름")
+    memo: str = Field(description="주의사항이나 꿀팁")
+
+class DayPlan(BaseModel):
+    day: str = Field(description="여행 일차 (예: 1일차)")
+    activities: List[DailyActivity] = Field(description="해당 일자의 활동 리스트")
+
+class TravelPlan(BaseModel):
+    title: str = Field(description="여행 제목")
+    summary: List[DayPlan] = Field(description="전체 여행 일정")
+    total_cost: str = Field(description="예상 총 경비")
+
+# 2. 모델 및 파서 설정
+llm = ChatOpenAI(""
+    model="gpt-4o-mini",             
+    temperature=0,
+    top_p=1.0,
+    frequency_penalty=0.0,
+    presence_penalty=0.0,
+    )   
+    # 일관성을 위해 0
+parser = PydanticOutputParser(pydantic_object=TravelPlan)
+
+# 3. 프롬프트 구성
+analysis_prompt = ChatPromptTemplate.from_messages([
+    ("system", "당신은 여행 전문가입니다. 사용자의 입력을 분석해 여행지, 기간, 선호 스타일을 핵심 요약하세요."),
+    MessagesPlaceholder(variable_name="history"),
+    ("human", "{input}")
+])
+
+# ★ 핵심 수정: planner_prompt에 format_instructions 추가
+planner_prompt = ChatPromptTemplate.from_messages([
+    ("system", "당신은 베테랑 가이드입니다. 분석된 정보를 바탕으로 상세 일정을 작성하세요. 반드시 제공된 형식을 지켜 JSON으로 답변하세요.\n\n{format_instructions}"),
+    MessagesPlaceholder(variable_name="history"),
+    ("human", "{analysis_result} 기반으로 최적의 일정을 짜줘.")
+]).partial(format_instructions=parser.get_format_instructions())
+
+# 4. LCEL 체인 연결
+analysis_chain = analysis_prompt | llm | StrOutputParser()
+full_chain = (
+    {"analysis_result": analysis_chain, "history": lambda x: x["history"]}
+    | planner_prompt 
+    | llm 
+    | parser # 최종 아웃풋은 TravelPlan 객체
+)
+
+# 5. 표 변환 함수
+def format_as_markdown_table(plan: TravelPlan) -> str:
+    md_text = f"## ✈️ {plan.title}\n\n"
+    for day_content in plan.summary:
+        md_text += f"### 📅 {day_content.day}\n"
+        md_text += "| 시간대 | 활동 내용 | 장소/맛집 | 비고 |\n"
+        md_text += "|:---:|:---|:---|:---|\n"
+        for act in day_content.activities:
+            md_text += f"| {act.time_slot} | {act.activity} | {act.location} | {act.memo} |\n"
+        md_text += "\n"
+    md_text += f"--- \n**💰 예상 총 경비:** {plan.total_cost}"
+    return md_text
+
+# 6. Gradio 인터페이스 함수
+def predict(message, history):
+    history_langchain = []
+    for human, ai in history:
+        history_langchain.append(HumanMessage(content=human))
+        history_langchain.append(AIMessage(content=ai))
+    
+    try:
+        # full_chain의 결과는 이제 TravelPlan 객체입니다.
+        response = full_chain.invoke({
+            "input": message,
+            "history": history_langchain
+        })
+        return format_as_markdown_table(response)
+    except Exception as e:
+        return f"데이터 파싱 중 오류가 발생했습니다. 다시 시도해주세요.\n(상세 에러: {str(e)})"
+
+# 7. 실행
+demo = gr.ChatInterface(
+    fn=predict,
+    title="🌍 나만의 AI 여행 플래너",
+    description="원하시는 여행 스타일을 말씀해주세요!",
+    examples=[
+        ["제주도 2박 3일, 부모님과 함께하는 효도 관광 맛집 위주"],
+        ["강원도 양양 1박 2일, 서핑과 해산물을 즐기는 역동적인 여행"],
+    ],
+)
+
+if __name__ == "__main__":
+    demo.launch()
