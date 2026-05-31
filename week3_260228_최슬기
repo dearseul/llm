@@ -1,0 +1,95 @@
+import gradio as gr
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_chroma import Chroma
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
+from pydantic import BaseModel, Field
+
+# [품질 향상] 문서 관련성 평가용 스키마
+class GradeAnswer(BaseModel):
+    """답변의 품질 및 질문과의 관련성 평가"""
+    score: str = Field(description="답변이 질문에 충분한 정보를 제공하는지 여부 ('yes' 또는 'no')")
+    reason: str = Field(description="평가 이유")
+
+# LLM 및 Retriever 초기화
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+vectorstore = Chroma(persist_directory="./chroma_db_summary", embedding_function=embeddings)
+retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={'k': 3, 'fetch_k': 10})
+
+# 구조화된 출력기 설정
+grader_llm = llm.with_structured_output(GradeAnswer)
+
+# [사용자 경험 개선] 대화 이력을 고려한 질문 재구성 프롬프트
+contextualize_q_system_prompt = """이전 대화 내용과 최신 사용자 질문이 주어졌을 때, 
+이전 대화 내용 없이도 이해할 수 있는 독립적인 질문으로 바꾸세요. 질문에 답할 필요는 없습니다."""
+
+contextualize_q_prompt = ChatPromptTemplate.from_messages([
+    ("system", contextualize_q_system_prompt),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+
+# [응답 품질 향상] 최종 답변 생성 프롬프트
+system_prompt = """당신은 주택청약 전문가입니다. 제공된 컨텍스트를 사용하여 답변하세요. 
+답변을 모른다면 모른다고 말하되 지어내지 마세요. 친절하게 답변하세요.
+
+콘텐츠: {context}"""
+
+qa_prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+
+# 메모리 저장소 (세션별 관리)
+store = {}
+
+def get_session_history(session_id: str):
+    if session_id not in store:
+        store[session_id] = ChatMessageHistory()
+    return store[session_id]
+
+# 체인 구성
+def get_rag_response(user_input, session_id="default"):
+    history = get_session_history(session_id)
+    
+    # 1. 문서 검색
+    docs = retriever.invoke(user_input)
+    context = "\n\n".join([d.page_content for d in docs])
+    
+    # 2. 답변 생성
+    rag_chain = qa_prompt | llm | StrOutputParser()
+    answer = rag_chain.invoke({"input": user_input, "context": context, "chat_history": history.messages})
+    
+    # 3. [품질 향상] 답변 검수 (Self-Correction)
+    grade = grader_llm.invoke(f"질문: {user_input}\n답변: {answer}")
+    
+    if grade.score == "no":
+        final_answer = f"⚠️ 죄송합니다. 정확한 FAQ 정보를 찾지 못했습니다. 보다 구체적으로 질문해 주시겠어요?\n(참고 사유: {grade.reason})"
+    else:
+        final_answer = answer
+        # 4. [사용자 경험] 대화 이력 업데이트 (성공적인 답변만 저장)
+        history.add_user_message(user_input)
+        history.add_ai_message(final_answer)
+        
+    return final_answer
+
+def predict(message, history):
+    # Gradio의 history 형식을 LangChain 메시지로 변환하거나, 
+    # 위에서 만든 get_rag_response의 세션 관리를 사용하여 응답 반환
+    response = get_rag_response(message)
+    return response
+
+# Gradio 실행
+demo = gr.ChatInterface(
+    predict,
+    title="🏢 스마트 주택청약 FAQ 챗봇",
+    description="청약 자격, 특별공급, 소득 기준 등 궁금한 점을 물어보세요!",
+    examples=["신혼부부 특별공급 조건 알려줘", "청약통장 해지하면 어떻게 돼?", "생애최초 소득 기준"]
+)
+
+if __name__ == "__main__":
+    demo.launch()
